@@ -5,8 +5,10 @@ new or already saved, then import selected rows as SSH connections (optionally
 into a sidebar group).
 
 Capabilities exercised (all from ``sshpilot.plugins.api``):
-* enumerating saved hosts (``ctx.list_connections`` — needs app API >= 1.4)
-* creating connections and groups (``ctx.add_connection`` / ``add_connection_group``)
+* enumerating saved hosts (``ctx.list_connections`` — needs app API >= 1.4;
+  without it every host previews as new)
+* creating/updating connections and groups (``ctx.add_connection`` /
+  ``add_connection_group`` / ``update_connection`` / ``add_connection_to_group``)
 * per-plugin persisted settings (``ctx.settings``)
 * a UI page (``ctx.ui.register_page``) and toasts (``ctx.ui.notify``)
 * background file parsing (``ctx.run_on_ui_thread``)
@@ -363,6 +365,52 @@ def diff_inventory(
             out.append(DiffRow(row=row, status=STATUS_NEW))
     return out
 
+
+@dataclass
+class ImportPlan:
+    """What an import will do, bucketed so the UI handler stays thin.
+
+    * ``new_by_group``: {group_name: [connection_data, …]} — created in groups.
+    * ``new_no_group``: [connection_data, …] — created at the sidebar root.
+    * ``changed``: [(nickname, connection_data, group), …] — existing nickname,
+      different host: update in place (and re-group if a group is set).
+    """
+
+    new_by_group: Dict[str, List[Dict[str, Any]]]
+    new_no_group: List[Dict[str, Any]]
+    changed: List[Tuple[str, Dict[str, Any], str]]
+
+
+def plan_import(
+    diff_rows: Sequence[DiffRow],
+    selected_indices: Iterable[int],
+    *,
+    default_user: str = "",
+    default_group: str = "",
+) -> ImportPlan:
+    """Turn the selected diff rows into an actionable import plan. Each row's
+    group is its own ``row.group`` when set, else ``default_group``. EXISTS rows
+    are skipped (nothing to do); unselected rows are ignored."""
+    new_by_group: Dict[str, List[Dict[str, Any]]] = {}
+    new_no_group: List[Dict[str, Any]] = []
+    changed: List[Tuple[str, Dict[str, Any], str]] = []
+    selected = set(selected_indices)
+    for index, item in enumerate(diff_rows):
+        if index not in selected or item.status == STATUS_EXISTS:
+            continue
+        row = item.row
+        group = (row.group or default_group or "").strip()
+        data = row.connection_data(default_user=default_user)
+        if item.status == STATUS_CHANGED:
+            changed.append((row.nickname, data, group))
+        elif group:
+            new_by_group.setdefault(group, []).append(data)
+        else:
+            new_no_group.append(data)
+    return ImportPlan(new_by_group=new_by_group, new_no_group=new_no_group,
+                      changed=changed)
+
+
 # --- plugin -----------------------------------------------------------------
 
 class Plugin(SshPilotPlugin):
@@ -372,8 +420,10 @@ class Plugin(SshPilotPlugin):
         self._default_user = ctx.settings.get("default_user", "")
         self._default_group = ctx.settings.get("default_group", "")
         self._last_path = ctx.settings.get("last_path", "")
+        self._select_changed = bool(ctx.settings.get("select_changed", False))
         self._diff_rows: List[DiffRow] = []
         self._selected: set = set()
+        self._select_changed_row = None
         self._list_box = None
         self._status_label = None
         self._parse_btn = None
@@ -398,7 +448,7 @@ class Plugin(SshPilotPlugin):
         import gi
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
-        from gi.repository import Adw, Gtk
+        from gi.repository import Adw, Gtk, Pango
 
         self._Gtk = Gtk
         self._Adw = Adw
@@ -443,13 +493,20 @@ class Plugin(SshPilotPlugin):
         self._group_entry = Adw.EntryRow(title="Sidebar group (optional)")
         self._group_entry.set_text(self._default_group)
         opts.add(self._group_entry)
+
+        self._select_changed_row = Adw.SwitchRow(
+            title="Also select changed hosts",
+            subtitle="Pre-select hosts whose saved address differs (overwrites on import)")
+        self._select_changed_row.set_active(self._select_changed)
+        self._select_changed_row.connect("notify::active", self._on_select_changed_toggled)
+        opts.add(self._select_changed_row)
         box.append(opts)
 
         file_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._path_label = Gtk.Label(label=self._last_path or "(no file chosen)")
         self._path_label.set_hexpand(True)
         self._path_label.set_halign(Gtk.Align.START)
-        self._path_label.set_ellipsize(3)  # Pango.EllipsizeMode.END
+        self._path_label.set_ellipsize(Pango.EllipsizeMode.END)
         file_row.append(self._path_label)
         pick_btn = Gtk.Button(label="Choose file…")
         pick_btn.connect("clicked", self._on_pick_file)
@@ -543,9 +600,12 @@ class Plugin(SshPilotPlugin):
             self._set_status(f"Failed to read file: {error}")
             return
         self._diff_rows = diff_rows
+        wanted = {STATUS_NEW}
+        if self._select_changed:
+            wanted.add(STATUS_CHANGED)
         self._selected = {
             index for index, item in enumerate(diff_rows)
-            if item.status == STATUS_NEW
+            if item.status in wanted
         }
         self._rebuild_preview()
         new_count = sum(1 for d in diff_rows if d.status == STATUS_NEW)
@@ -606,41 +666,117 @@ class Plugin(SshPilotPlugin):
             self._selected.discard(index)
         self._import_btn.set_sensitive(bool(self._selected))
 
-    def _on_import_clicked(self, _btn) -> None:
+    def _on_select_changed_toggled(self, row, _param) -> None:
+        self._select_changed = row.get_active()
+        self.ctx.settings.set("select_changed", self._select_changed)
+        if not self._diff_rows:
+            return
+        wanted = {STATUS_NEW}
+        if self._select_changed:
+            wanted.add(STATUS_CHANGED)
+        self._selected = {
+            index for index, item in enumerate(self._diff_rows)
+            if item.status in wanted
+        }
+        self._rebuild_preview()
+        self._import_btn.set_sensitive(bool(self._selected))
+
+    def _on_import_clicked(self, button) -> None:
         if not self._selected:
             return
         default_user = self._user_entry.get_text().strip()
         default_group = self._group_entry.get_text().strip()
-        to_import = [self._diff_rows[i].row for i in sorted(self._selected)]
+        plan = plan_import(
+            self._diff_rows, self._selected,
+            default_user=default_user, default_group=default_group)
 
+        # CHANGED rows overwrite an existing connection in place — confirm first.
+        if plan.changed:
+            import gi
+            gi.require_version("Adw", "1")
+            from gi.repository import Adw
+            names = ", ".join(n for n, _d, _g in plan.changed[:5])
+            extra = "" if len(plan.changed) <= 5 else f" (+{len(plan.changed) - 5} more)"
+            dialog = Adw.MessageDialog(
+                transient_for=button.get_root(),
+                heading="Overwrite existing connections?",
+                body=(f"{len(plan.changed)} selected host(s) already exist with a "
+                      f"different address and will be updated in place: "
+                      f"{names}{extra}."))
+            dialog.add_response("cancel", "Cancel")
+            dialog.add_response("apply", "Update & import")
+            dialog.set_response_appearance("apply", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response("cancel")
+            dialog.set_close_response("cancel")
+            dialog.connect(
+                "response",
+                lambda _d, resp: self._apply_plan(plan) if resp == "apply" else None)
+            dialog.present()
+            return
+        self._apply_plan(plan)
+
+    def _apply_plan(self, plan) -> None:
         imported = 0
         errors: List[str] = []
-        group_name = default_group
-        if group_name:
-            payloads = [
-                row.connection_data(default_user=default_user)
-                for row in to_import
-            ]
+
+        # New connections that belong in a group — one batched sidebar rebuild
+        # per group.
+        for group_name, payloads in plan.new_by_group.items():
             try:
                 _gid, infos = self.ctx.add_connection_group(group_name, payloads)
-                imported = len(infos)
-            except Exception as exc:
-                errors.append(str(exc))
-        else:
-            for row in to_import:
-                try:
-                    self.ctx.add_connection(
-                        row.connection_data(default_user=default_user))
+                imported += len(infos)
+            except Exception as exc:  # provisioning is best-effort
+                errors.append(f"{group_name}: {exc}")
+
+        # New connections at the sidebar root.
+        for data in plan.new_no_group:
+            try:
+                self.ctx.add_connection(data)
+                imported += 1
+            except ValueError as exc:
+                errors.append(f"{data.get('nickname', '?')}: {exc}")
+
+        # Existing nicknames whose host/user/port changed — update in place.
+        for nickname, data, group_name in plan.changed:
+            try:
+                if self.ctx.update_connection(nickname, data):
                     imported += 1
-                except ValueError as exc:
-                    errors.append(f"{row.nickname}: {exc}")
+                    if group_name:
+                        gid = self.ctx.create_group(group_name)
+                        if gid:
+                            self.ctx.add_connection_to_group(nickname, gid)
+                else:
+                    errors.append(f"{nickname}: not found")
+            except Exception as exc:
+                errors.append(f"{nickname}: {exc}")
 
         self._set_status(
             f"Imported {imported} connection(s)."
             + (f" Errors: {'; '.join(errors)}" if errors else ""))
         self.ctx.ui.notify(f"Imported {imported} connection(s)")
-        self._import_btn.set_sensitive(False)
         self._selected.clear()
+        self._import_btn.set_sensitive(False)
+        # Re-diff against the now-updated connection list so imported rows flip
+        # to EXISTS and the preview reflects reality.
+        self._refresh_diff()
+
+    def _refresh_diff(self) -> None:
+        """Recompute statuses for the already-parsed rows against the current
+        saved connections and rebuild the preview."""
+        rows = [item.row for item in self._diff_rows]
+        existing = (self.ctx.list_connections()
+                    if hasattr(self.ctx, "list_connections") else [])
+        self._diff_rows = diff_inventory(
+            rows, existing, default_user=self._default_user)
+        wanted = {STATUS_NEW}
+        if self._select_changed:
+            wanted.add(STATUS_CHANGED)
+        self._selected = {
+            index for index, item in enumerate(self._diff_rows)
+            if item.status in wanted
+        }
+        self._rebuild_preview()
+        self._import_btn.set_sensitive(bool(self._selected))
 
     def _set_status(self, text: str) -> None:
         if self._status_label is not None:

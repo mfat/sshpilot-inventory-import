@@ -93,6 +93,54 @@ def test_diff_inventory_changed_nickname():
     assert diff[0].status == mod.STATUS_CHANGED
 
 
+def test_plan_import_buckets_by_group_and_status():
+    mod = _load()
+    diff = [
+        mod.DiffRow(row=mod.HostRow("a", "10.0.0.1", group="prod"),
+                    status=mod.STATUS_NEW),
+        mod.DiffRow(row=mod.HostRow("b", "10.0.0.2"),  # no row group
+                    status=mod.STATUS_NEW),
+        mod.DiffRow(row=mod.HostRow("c", "10.0.0.3", group="prod"),
+                    status=mod.STATUS_NEW),
+        mod.DiffRow(row=mod.HostRow("d", "10.0.0.4"),
+                    status=mod.STATUS_CHANGED, existing_nickname="d"),
+        mod.DiffRow(row=mod.HostRow("e", "10.0.0.5"),
+                    status=mod.STATUS_EXISTS, existing_nickname="e"),
+    ]
+    # Select everything; EXISTS must still be skipped.
+    plan = mod.plan_import(diff, range(len(diff)),
+                           default_user="root", default_group="fallback")
+
+    # a + c go to their own row group "prod"; b falls back to "fallback".
+    assert set(plan.new_by_group) == {"prod", "fallback"}
+    assert [d["nickname"] for d in plan.new_by_group["prod"]] == ["a", "c"]
+    assert [d["nickname"] for d in plan.new_by_group["fallback"]] == ["b"]
+    assert plan.new_no_group == []
+    # d is CHANGED → update bucket, with the fallback group.
+    assert plan.changed == [("d", plan.changed[0][1], "fallback")]
+    assert plan.changed[0][1]["host"] == "10.0.0.4"
+    # default_user is applied to payloads.
+    assert plan.new_by_group["prod"][0]["username"] == "root"
+
+
+def test_plan_import_no_default_group_goes_to_root():
+    mod = _load()
+    diff = [mod.DiffRow(row=mod.HostRow("a", "10.0.0.1"), status=mod.STATUS_NEW)]
+    plan = mod.plan_import(diff, [0])
+    assert plan.new_by_group == {}
+    assert [d["nickname"] for d in plan.new_no_group] == ["a"]
+
+
+def test_plan_import_ignores_unselected():
+    mod = _load()
+    diff = [
+        mod.DiffRow(row=mod.HostRow("a", "10.0.0.1"), status=mod.STATUS_NEW),
+        mod.DiffRow(row=mod.HostRow("b", "10.0.0.2"), status=mod.STATUS_NEW),
+    ]
+    plan = mod.plan_import(diff, [1])
+    assert [d["nickname"] for d in plan.new_no_group] == ["b"]
+
+
 def test_activate_registers_page():
     mod = _load()
 
